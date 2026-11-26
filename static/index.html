@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chess Coach — lokální trenér</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="logo">♞</span><span>Chess Coach</span></div>
+  <div class="who" id="who">lokální · Stockfish</div>
+  <div class="spacer"></div>
+  <label class="field compact">Deska <select id="boardTheme"></select></label>
+  <label class="field compact">Figury <select id="pieceTheme"></select></label>
+  <label class="field compact">Zvuk <select id="soundTheme">
+    <option value="default">default</option>
+    <option value="beat">beat</option>
+  </select></label>
+  <label class="field compact">Animace <select id="animSpeed">
+    <option value="default" selected>výchozí 200 ms</option>
+    <option value="none">žádná</option>
+    <option value="fast">rychlá</option>
+    <option value="normal">normální</option>
+    <option value="slow">pomalá</option>
+  </select></label>
+  <button id="soundBtn" class="icon-btn" title="Zapnout / vypnout zvuk">🔊</button>
+  <button id="evalBtn" class="icon-btn" title="Skrýt / zobrazit eval bar">≈</button>
+  <button id="flipBtn" class="icon-btn" title="Otočit desku">⇅</button>
+  <button id="newBtn" class="primary">Nová partie</button>
+</header>
+
+<main>
+  <div class="board-col">
+    <div class="eval-wrap" id="evalWrap">
+      <div class="evalbar" id="evalBar"><div class="eval-zero" id="evalZero"></div></div>
+      <div class="eval-label" id="evalLabel">0.0</div>
+    </div>
+
+    <div class="board-stack">
+      <div class="clockbar" id="clockTop">
+        <span class="pname" id="nameTop">Stockfish</span>
+        <span class="ptime" id="timeTop">10:00</span>
+      </div>
+
+      <div class="board-wrap" id="boardWrap">
+        <div class="board-img" id="boardImg"></div>
+        <div class="squares" id="squares"></div>
+        <div class="pieces" id="pieces"></div>
+        <svg class="arrows" id="arrows" viewBox="0 0 8 8" preserveAspectRatio="none"></svg>
+        <div class="promo hidden" id="promo"></div>
+        <div class="thinking hidden" id="thinking">Stockfish přemýšlí…</div>
+      </div>
+
+      <div class="clockbar" id="clockBottom">
+        <span class="pname" id="nameBottom">Ty</span>
+        <span class="ptime" id="timeBottom">10:00</span>
+      </div>
+    </div>
+  </div>
+
+  <aside class="side">
+    <section class="card coach-card">
+      <div class="card-head"><h2>Kouč</h2><span class="tag" id="modeTag">Trénink</span></div>
+      <div id="coachBody" class="coach-body">Zahraj tah na desce.</div>
+    </section>
+
+    <section class="card moves-card">
+      <div class="card-head"><h2>Tahy</h2><span class="muted" id="moveCount"></span></div>
+      <div id="moveList" class="move-list"></div>
+    </section>
+
+    <div class="actions">
+      <button id="takebackBtn">↶ Vzít tah zpět</button>
+      <button id="reviewBtn" class="primary" disabled>Analyzovat partii</button>
+    </div>
+    <button id="resignBtn" class="ghost danger">Vzdát partii</button>
+    <div class="status" id="statusLine"></div>
+  </aside>
+
+  <section class="card review-card hidden" id="reviewPanel">
+    <div class="review-head">
+      <div>
+        <div class="review-acc" id="rvAcc">—</div>
+        <div class="muted" id="rvSub">Přesnost</div>
+      </div>
+      <button id="rvClose" class="icon-btn" title="Zavřít review">✕</button>
+    </div>
+
+    <div id="rvCounts" class="review-counts"></div>
+
+    <div class="graph-wrap"><canvas id="rvGraph"></canvas></div>
+    <div class="review-hint">zelená = nejlepší · červená = sehráno</div>
+
+    <div class="review-nav">
+      <button id="rvPrev" class="icon-btn" title="Předchozí půltah">←</button>
+      <span id="rvWhere">—</span>
+      <button id="rvNext" class="icon-btn" title="Další půltah">→</button>
+      <span class="spacer"></span>
+      <a id="pgnLink" class="btn small" href="#" download>PGN</a>
+    </div>
+
+    <div class="worst" id="rvWorst"></div>
+
+    <div class="rv-progress hidden" id="rvProgress">
+      <div class="bar"><div id="rvProgressBar"></div></div>
+      <span id="rvProgressText">Analyzuji…</span>
+    </div>
+  </section>
+</main>
+
+<div class="overlay" id="setupOverlay">
+  <div class="setup">
+    <div class="setup-head">
+      <h1>Nová partie</h1>
+      <span class="muted">lokálně, bez internetu</span>
+    </div>
+
+    <label class="lbl">Barva</label>
+    <div class="chips" id="colorChips">
+      <button type="button" class="chip on" data-color="white">Bílá</button>
+      <button type="button" class="chip" data-color="black">Černá</button>
+      <button type="button" class="chip" data-color="random">Náhodně</button>
+    </div>
+
+    <label class="lbl">Tempo <span class="muted">(bez bulletu)</span></label>
+    <div class="chips" id="timeChips">
+      <button type="button" class="chip" data-base="180" data-inc="0">3|0</button>
+      <button type="button" class="chip" data-base="180" data-inc="2">3|2</button>
+      <button type="button" class="chip on" data-base="300" data-inc="0">5|0</button>
+      <button type="button" class="chip" data-base="300" data-inc="5">5|5</button>
+      <button type="button" class="chip" data-base="600" data-inc="0">10|0</button>
+      <button type="button" class="chip" data-base="600" data-inc="5">10|5</button>
+      <button type="button" class="chip" data-base="900" data-inc="10">15|10</button>
+      <button type="button" class="chip" data-base="1800" data-inc="0">30|0</button>
+    </div>
+
+    <div class="custom-time">
+      <label>Základ (min) <input id="baseMin" type="number" min="0.5" max="180" step="0.5" value="5"></label>
+      <label>Přírůstek (s) <input id="incSec" type="number" min="0" max="180" step="1" value="0"></label>
+    </div>
+
+    <label class="lbl">Úroveň soupeře <output id="levelOut">8</output></label>
+    <input id="levelRange" type="range" min="4" max="16" step="1" value="8">
+
+    <label class="lbl">Režim</label>
+    <div class="chips modes" id="modeChips">
+      <button type="button" class="chip on" data-mode="training">Trénink<small>okamžitá rada</small></button>
+      <button type="button" class="chip" data-mode="sharp">Ostrá<small>bez rad do konce</small></button>
+      <button type="button" class="chip" data-mode="analysis">Analýza<small>rady + eval bar</small></button>
+    </div>
+
+    <label class="lbl">Jméno</label>
+    <input id="playerName" type="text" maxlength="40" value="me" autocomplete="off">
+
+    <div class="setup-foot">
+      <button id="setupCancel" class="ghost hidden">Zpět do partie</button>
+      <span class="spacer"></span>
+      <button id="startBtn" class="primary big">Hrát</button>
+    </div>
+    <div class="muted small" id="setupHint"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="motion.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

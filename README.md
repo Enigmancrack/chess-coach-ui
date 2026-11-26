@@ -75,9 +75,47 @@ python3 coach.py play --level 8 --player viktor
 python3 coach.py play --level 12 --player viktor --color black
 python3 coach.py review              # poslední uložená partie
 python3 coach.py review cesta.json   # konkrétní soubor
+python3 coach.py import ~/.chess_bot_journals/123456.done.jsonl
+python3 coach.py games               # tabulka importovaných partií
 ```
 
 Tahy se zadávají jako SAN (`Nf3`) nebo UCI (`g1f3`), `quit` partii ukončí.
+
+## Import partií bota
+
+Aplikace umí otevřít partie, které sehrál šachový bot, bez přehrávání a bez
+prohlížeče. Bere dva zdroje:
+
+- `~/.chess_bot_journals/*.jsonl` — deník bota (`game_start`, `our_move`,
+  `opp_move`, `game_end`; neznámé typy se ignorují, rozbitý řádek přeskočí).
+  Deník, který začíná v průběhu partie, se ukotví na `fen` u `our_move`, takže
+  se importuje jen ta část, která jde přehrát.
+- `~/.chess_coach_games/*.json` — hotová partie v uživatelském formátu
+  (uložený `review` se použije beze změny).
+
+Deník nese vlastní evaluace bota, takže review se **nepočítá znovu**: schéma
+`jev před tvými tahy` znamená, že bot měří pozici vždy před svým tahem; ztráta
+tahu se proto bere mezi dvěma po sobě jdoucími vzorky (a UI to řekne).
+Když evaluace chybí, teprve se spustí Stockfish.
+
+Import zapisuje jen do `COACH_DATA_DIR/imports/`; cesty mimo
+`~/.chess_bot_journals` a `~/.chess_coach_games` server odmítne (400).
+Profil soupeře se čte z `~/.chess_opponent_model.json` **jen pro čtení** a na
+review obrazovce se zobrazí jako „model si o soupeři myslí…“.
+
+| Proměnná | Význam | Default |
+|---|---|---|
+| `COACH_JOURNAL_DIR` | adresář deníků bota | `~/.chess_bot_journals` |
+| `COACH_MODEL_FILE` | model soupeřů (read-only) | `~/.chess_opponent_model.json` |
+
+API: `POST /api/import {"path": "..."}` → `{ok, gid, game, state}`,
+`GET /api/games` → `{games: [...], imports, journals, games_dir}`.
+Importovaná partie se pak chová jako každá jiná (`/api/state`, `/api/review`,
+`/api/pgn`), jen se v ní nedá táhnout.
+
+UI: karta **Partie bota** v pravém sloupci — vlož cestu k deníku, `Import`,
+kliknutím se partie otevře i s review.
+
 Na konci se vypíše review a partie se uloží jako JSON do `COACH_DATA_DIR`.
 
 ## Testy a kontroly

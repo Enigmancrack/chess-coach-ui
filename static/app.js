@@ -11,7 +11,7 @@ const LABEL = {
   book: 'Book', inaccuracy: 'Inaccuracy', mistake: 'Mistake',
   blunder: 'Blunder', miss: 'Miss'
 };
-const MODE_LABEL = { training: 'Trénink', sharp: 'Ostrá', analysis: 'Analýza' };
+const MODE_LABEL = { training: 'Trénink', sharp: 'Ostrá', analysis: 'Analýza', import: 'Import' };
 const PRESETS = [
   [180, 0], [180, 2], [300, 0], [300, 5],
   [600, 0], [600, 5], [900, 10], [1800, 0]
@@ -452,7 +452,7 @@ function applyState(st) {
 
   if (st.over) {
     S.premove = null;
-    if (!sameGame || !prev.over) {
+    if (!st.imported && (!sameGame || !prev.over)) {
       // Victory/defeat lands 600 ms after the final move, never mid-slide.
       setTimeout(() => playResultSound(st), 600);
     }
@@ -611,7 +611,8 @@ function updateSideLabels(st) {
   const bottomColor = S.orientation;
   const name = (color) => (color === st.my_color
     ? st.player
-    : `Stockfish (lvl ${st.level})`);
+    : (st.imported ? (st.opponent || 'soupeř')
+      : `Stockfish (lvl ${st.level})`));
   $('nameTop').textContent = name(topColor);
   $('nameBottom').textContent = name(bottomColor);
   $('clockTop').classList.toggle('active', !st.over && st.turn === topColor);
@@ -1080,6 +1081,151 @@ async function poll() {
   }
 }
 
+/* ── imported games (the bot's journals and stored games) ─────────────── */
+
+const EVAL_SOURCE = {
+  journal: 'eval z deníku',
+  review: 'eval z uložené partie',
+  engine: 'dopočítáno Stockfishem',
+};
+
+function insightText(insight) {
+  if (!insight || !insight.available) return '';
+  const parts = [];
+  if (insight.elo_estimate) {
+    parts.push(`elo ≈ ${insight.elo_estimate}`
+      + (insight.elo_variance ? ` ±${Math.round(insight.elo_variance)}` : ''));
+  }
+  if (insight.style) parts.push(`styl ${String(insight.style).replace(/_/g, ' ')}`);
+  if (insight.weakness) {
+    parts.push(`slabina ${String(insight.weakness).replace(/_/g, ' ')}`);
+  }
+  if (insight.games) {
+    parts.push(`${insight.games} partií (${insight.wins || 0}–`
+      + `${insight.losses || 0}–${insight.draws || 0})`);
+  }
+  return parts.join(' · ');
+}
+
+function renderInsight() {
+  const host = $('rvInsight');
+  const insight = S.st ? S.st.insight : null;
+  const text = insightText(insight);
+  host.replaceChildren();
+  if (!text) {
+    host.classList.add('hidden');
+    return;
+  }
+  const head = document.createElement('div');
+  head.className = 'rv-insight-head';
+  head.textContent = 'Model si o soupeři myslí…';
+  const body = document.createElement('div');
+  body.textContent = text;
+  const foot = document.createElement('div');
+  foot.className = 'muted small';
+  foot.textContent = 'read-only data z bota (.chess_opponent_model.json)';
+  host.append(head, body, foot);
+  host.classList.remove('hidden');
+}
+
+function renderLibrary(rows) {
+  const host = $('libList');
+  host.replaceChildren();
+  $('libCount').textContent = String(rows.length);
+  if (!rows.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted small';
+    empty.textContent = 'Zatím nic. Vlož cestu k deníku bota a dej Import.';
+    host.appendChild(empty);
+    return;
+  }
+  for (const row of rows) {
+    const item = document.createElement('button');
+    item.className = 'lib-row';
+    item.dataset.gid = row.id;
+    if (S.gid === row.id) item.classList.add('active');
+    const left = document.createElement('span');
+    left.className = 'lib-main';
+    left.textContent = `${row.result || '*'} · ${row.moves || 0} tahů`;
+    const right = document.createElement('span');
+    right.className = 'lib-meta';
+    const accuracy = row.accuracy === null || row.accuracy === undefined
+      ? '—' : `${Number(row.accuracy).toFixed(1)} %`;
+    right.textContent = [row.date, accuracy].filter(Boolean).join(' · ');
+    const who = document.createElement('span');
+    who.className = 'lib-opp muted small';
+    who.textContent = [row.opponent || 'soupeř', row.time_control]
+      .filter(Boolean).join(' · ');
+    const body = document.createElement('span');
+    body.className = 'lib-body';
+    body.append(left, who);
+    item.append(body, right);
+    item.addEventListener('click', () => openImported(row.id));
+    host.appendChild(item);
+  }
+}
+
+async function loadGames() {
+  try {
+    const data = await api('api/games');
+    renderLibrary(data.games || []);
+  } catch (error) {
+    renderLibrary([]);
+    showToast((error.data && error.data.error) || 'Seznam partií se nenačetl');
+  }
+}
+
+async function importGame() {
+  const field = $('importPath');
+  const path = field.value.trim();
+  if (!path) {
+    showToast('Vlož cestu k deníku nebo partii');
+    field.focus();
+    return;
+  }
+  $('importBtn').disabled = true;
+  try {
+    const data = await api('api/import', { method: 'POST', body: { path } });
+    field.value = '';
+    showToast(`Importováno: ${data.game ? data.game.moves : 0} tahů`);
+    await loadGames();
+    await openImported(data.gid);
+  } catch (error) {
+    showToast((error.data && error.data.error) || 'Import se nepovedl', 6000);
+  } finally {
+    $('importBtn').disabled = false;
+  }
+}
+
+async function openImported(gid) {
+  if (!gid) return;
+  if (S.reviewActive) closeReview();
+  stopPolling();
+  S.review = null;
+  S.reviewBusy = false;
+  let st;
+  try {
+    st = await api(`api/state?gid=${encodeURIComponent(gid)}`);
+  } catch (error) {
+    showToast((error.data && error.data.error) || 'Partii nelze otevřít');
+    return;
+  }
+  S.st = null; // a different game: never tween from the current position
+  S.playedUci = new Set();
+  applyState(st);
+  renderLibrarySnapshot();
+  openReview();
+}
+
+function renderLibrarySnapshot() {
+  const active = $('libList').querySelector('.lib-row.active');
+  if (active) active.classList.remove('active');
+  if (!S.gid) return;
+  for (const row of $('libList').querySelectorAll('.lib-row')) {
+    row.classList.toggle('active', row.dataset.gid === S.gid);
+  }
+}
+
 /* ── review ────────────────────────────────────────────────────────────── */
 
 async function openReview() {
@@ -1145,6 +1291,22 @@ function renderReview(report) {
   $('rvAcc').textContent = `${Number(report.accuracy || 0).toFixed(1)} %`;
   $('rvSub').textContent = `Přesnost · ${report.moves || 0} tvých tahů`
     + ` · průměrná ztráta ${report.avg_loss || 0} cp`;
+  const source = EVAL_SOURCE[report.eval_source]
+    || EVAL_SOURCE[(S.st && S.st.eval_source) || ''];
+  if (source) {
+    $('rvSub').textContent += ` · ${source}`;
+    if (report.sampling === 'our_turn') {
+      $('rvSub').textContent += ' (eval před tvými tahy)';
+    }
+  }
+  renderInsight();
+  const hint = document.querySelector('.review-hint');
+  const hasBest = (report.plies || []).some((ply) => ply.best_uci);
+  if (hint) {
+    hint.textContent = hasBest
+      ? 'zelená = nejlepší · červená = sehráno'
+      : 'modrá = sehráno · deník nemá uloženou alternativu';
+  }
 
   const counts = report.counts || {};
   const host = $('rvCounts');
@@ -1311,7 +1473,9 @@ function drawArrows(ply) {
     drawArrow(best, '#15781B', shared ? MOTION.ARROW_DEST_SHIFT : 0);
   }
   if (ply.uci !== ply.best_uci) {
-    drawArrow(ply.uci, '#882020', 0);
+    // Without a recorded best move (an imported journal) there is nothing to
+    // compare against, so the played move is not "wrong" — draw it neutral.
+    drawArrow(ply.uci, best || ply.best_uci ? '#882020' : '#5b8bb0', 0);
   }
 }
 
@@ -1613,6 +1777,12 @@ function wire() {
   $('newBtn').addEventListener('click', showSetup);
   $('setupCancel').addEventListener('click', hideSetup);
 
+  $('importBtn').addEventListener('click', importGame);
+  $('libRefresh').addEventListener('click', loadGames);
+  $('importPath').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') importGame();
+  });
+
   $('colorChips').addEventListener('click', (event) => {
     const chip = event.target.closest('.chip');
     if (!chip) return;
@@ -1794,6 +1964,7 @@ async function init() {
   tickClocks();
   showSetup();
   await loadThemes();
+  loadGames();
   try {
     const health = await api('api/health');
     if (!health.engine_present) showToast('Stockfish nenalezen — nastav COACH_STOCKFISH.', 8000);

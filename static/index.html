@@ -71,6 +71,22 @@
       <div id="moveList" class="move-list"></div>
     </section>
 
+    <section class="card lib-card">
+      <div class="card-head">
+        <h2>Partie bota</h2>
+        <span class="tag" id="libCount">0</span>
+      </div>
+      <div class="lib-import">
+        <input id="importPath" type="text" spellcheck="false"
+               placeholder="~/.chess_bot_journals/123456.done.jsonl">
+        <button id="importBtn" class="ghost small">Import</button>
+        <button id="libRefresh" class="icon-btn small" title="Obnovit seznam">⟳</button>
+      </div>
+      <div id="libList" class="lib-list">
+        <p class="muted small">Načítám…</p>
+      </div>
+    </section>
+
     <div class="actions">
       <button id="takebackBtn">↶ Vzít tah zpět</button>
       <button id="reviewBtn" class="primary" disabled>Analyzovat partii</button>
@@ -87,6 +103,8 @@
       </div>
       <button id="rvClose" class="icon-btn" title="Zavřít review">✕</button>
     </div>
+
+    <div id="rvInsight" class="rv-insight hidden"></div>
 
     <div id="rvCounts" class="review-counts"></div>
 

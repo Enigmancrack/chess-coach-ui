@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 import chess
 
 import game as game_mod
+import importer
 from engine import DEFAULT_STOCKFISH, StockfishEngine
 
 ROOT = Path(__file__).resolve().parent
@@ -30,16 +31,26 @@ MAX_BODY = 64 * 1024
 MAX_GAMES = 40
 
 ENGINE = StockfishEngine(STOCKFISH)
-GAMES: dict[str, game_mod.Game] = {}
+GAMES: dict[str, Any] = {}
 GAMES_LOCK = threading.Lock()
 
 
-def get_game(gid: str) -> game_mod.Game | None:
+def get_game(gid: str) -> Any | None:
     with GAMES_LOCK:
-        return GAMES.get(gid)
+        cached = GAMES.get(gid)
+    if cached is not None:
+        return cached
+    # An imported game lives on disk: reopening it after a restart must work
+    # from the listing alone, without importing it again.
+    record = importer.get(gid)
+    if record is None:
+        return None
+    game = game_mod.ImportedGame(record, ENGINE)
+    put_game(gid, game)
+    return game
 
 
-def put_game(gid: str, game: game_mod.Game) -> None:
+def put_game(gid: str, game: Any) -> None:
     with GAMES_LOCK:
         GAMES[gid] = game
         while len(GAMES) > MAX_GAMES:
@@ -165,6 +176,14 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/themes":
             self._json(themes())
             return
+        if path == "/api/games":
+            self._json({
+                "games": importer.list_games(),
+                "imports": str(importer.imports_dir()),
+                "journals": str(importer.journal_dir()),
+                "games_dir": str(importer.games_dir()),
+            })
+            return
         if path == "/api/state":
             game = get_game(self._query("gid"))
             if game is None:
@@ -225,6 +244,32 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json(game.resign())
                 return
             self._json(game.start_review())
+            return
+        if path == "/api/import":
+            raw = body.get("path")
+            if not isinstance(raw, str) or not raw.strip():
+                self._json({"error": "chybí cesta k partii"},
+                           HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                record = importer.import_path(raw)
+            except importer.ImportRejected as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            except FileNotFoundError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+                return
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            imported = game_mod.ImportedGame(record, ENGINE)
+            put_game(imported.gid, imported)
+            self._json({
+                "ok": True,
+                "gid": imported.gid,
+                "game": importer.summary(record),
+                "state": imported.state(),
+            })
             return
         self._json({"error": "neznámý endpoint"}, HTTPStatus.NOT_FOUND)
 

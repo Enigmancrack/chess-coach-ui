@@ -328,21 +328,23 @@ class Game:
             self.review_total = max(1, total)
 
     def start_review(self) -> dict[str, Any]:
+        fen = self.start_fen
+        ucis = [m["uci"] for m in self.moves]
+        color = self.player_color
+        depth = self.review_depth
+        start = False
         with self._review_lock:
-            if self.review_status == "running":
-                return self.review_payload()
-            self.review_status = "running"
-            self.review_progress = 0
-            self.review_total = max(1, len(self.moves))
-            self.report = None
-            self.review_error = None
-            fen = self.start_fen
-            ucis = [m["uci"] for m in self.moves]
-            color = self.player_color
-            depth = self.review_depth
-        threading.Thread(target=self._review_worker,
-                         args=(fen, ucis, color, depth),
-                         daemon=True, name=f"review-{self.gid}").start()
+            if self.review_status != "running":
+                self.review_status = "running"
+                self.review_progress = 0
+                self.review_total = max(1, len(self.moves))
+                self.report = None
+                self.review_error = None
+                start = True
+        if start:
+            threading.Thread(target=self._review_worker,
+                             args=(fen, ucis, color, depth),
+                             daemon=True, name=f"review-{self.gid}").start()
         return self.review_payload()
 
     def _review_worker(self, fen: str, ucis: list[str],
@@ -390,3 +392,243 @@ class Game:
                 time_control=f"{self.base}+{self.inc}",
                 mode=self.mode,
             )
+
+
+class ImportedGame:
+    """A game the bot recorded, replayed read-only in the normal board.
+
+    It answers the same methods the HTTP layer calls (`state`, `review_payload`,
+    `start_review`, `pgn`), so an import needs no separate UI path: the board,
+    the move list and the review panel all work as they do for a live game.
+    There is nothing to play — moves, takeback and resign are refused — and the
+    bot's stored evaluations are used as they are; Stockfish is started only
+    when the journal carried no evaluations at all.
+    """
+
+    def __init__(self, record: dict[str, Any],
+                 engine: EngineLike | None = None) -> None:
+        self.record = record
+        self.gid = str(record.get("id") or "")
+        self.player = str(record.get("player") or "bot")[:40] or "bot"
+        self.my_color = "black" if record.get("my_color") == "black" else "white"
+        self.player_color = chess.BLACK if self.my_color == "black" else chess.WHITE
+        self.opponent = str(record.get("opponent") or "")
+        self.mode = "import"
+        self.level = 0
+        self.start_fen = str(record.get("start_fen") or chess.STARTING_FEN)
+        self.result = str(record.get("result") or "*")
+        self.time_control = str(record.get("time_control") or "-")
+        self.eval_source = str(record.get("eval_source") or "none")
+        self.insight = record.get("insight") if isinstance(
+            record.get("insight"), dict) else {}
+        self.moves: list[dict[str, Any]] = [
+            dict(entry) for entry in (record.get("moves") or [])
+            if isinstance(entry, dict) and entry.get("uci")
+        ]
+        self.ucis: list[str] = [entry["uci"] for entry in self.moves]
+        self.base, self.inc = self._timebase()
+        self.engine = engine
+        self.review_depth = int(os.environ.get("COACH_REVIEW_DEPTH", "12"))
+        self.report: dict[str, Any] | None = (
+            record.get("report") if isinstance(record.get("report"), dict) else None)
+        self.review_status = "ready" if self.report is not None else "idle"
+        self.review_progress = len(self.ucis) if self.report is not None else 0
+        self.review_total = max(1, len(self.ucis))
+        self.review_error: str | None = None
+        self._review_lock = threading.Lock()
+        self.engine_error: str | None = None
+        self._board = self._replay()
+
+    # ── helpers ────────────────────────────────────────────────────────────
+    def _timebase(self) -> tuple[int, int]:
+        text = self.time_control.replace("|", "+")
+        head, _, tail = text.partition("+")
+        try:
+            return max(10, int(float(head) * 60)), max(0, int(float(tail)))
+        except ValueError:
+            return 600, 0
+
+    def _replay(self) -> chess.Board:
+        board = chess.Board(self.start_fen)
+        for entry in self.moves:
+            try:
+                move = chess.Move.from_uci(entry["uci"])
+            except ValueError:
+                break
+            if move not in board.legal_moves:
+                break
+            board.push(move)
+        return board
+
+    def _clocks(self) -> dict[str, float]:
+        stored = self.record.get("clocks")
+        clocks = {"white": float(self.base), "black": float(self.base)}
+        if isinstance(stored, dict):
+            for side in ("white", "black"):
+                value = stored.get(side)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    clocks[side] = float(value)
+        return clocks
+
+    # ── read model ─────────────────────────────────────────────────────────
+    def state(self) -> dict[str, Any]:
+        board = self._board
+        verdicts: dict[int, dict[str, Any]] = {}
+        if isinstance(self.report, dict):
+            for ply in self.report.get("plies") or []:
+                if isinstance(ply, dict) and ply.get("verdict"):
+                    verdicts[int(ply.get("ply") or 0)] = ply
+        moves: list[dict[str, Any]] = []
+        for entry in self.moves:
+            item = dict(entry)
+            ply = verdicts.get(int(item.get("ply") or 0))
+            if ply is not None:
+                item["verdict"] = ply.get("verdict")
+                item["loss"] = ply.get("loss")
+                item["best"] = ply.get("best")
+            moves.append(item)
+        last_uci = self.ucis[-1] if self.ucis else None
+        check_square = None
+        if board.is_check():
+            square = rules.king_square(board, board.turn)
+            if square is not None:
+                check_square = chess.square_name(square)
+        note = None
+        if isinstance(self.report, dict) and self.report.get("plies"):
+            for ply in reversed(self.report["plies"]):
+                if isinstance(ply, dict) and ply.get("verdict"):
+                    note = {
+                        "san": ply.get("san"),
+                        "uci": ply.get("uci"),
+                        "loss": ply.get("loss"),
+                        "best": ply.get("best"),
+                        "text": ply.get("text"),
+                        "verdict": ply.get("verdict"),
+                        "eval_before": ply.get("eval_before"),
+                        "eval_after": ply.get("eval_after"),
+                    }
+                    break
+        eval_cp = 0
+        if isinstance(self.report, dict):
+            curve = self.report.get("evals") or []
+            if curve:
+                eval_cp = int(curve[-1])
+        with self._review_lock:
+            status = self.review_status
+            progress = self.review_progress
+            total = self.review_total
+        return {
+            "gid": self.gid,
+            "player": self.player,
+            "my_color": self.my_color,
+            "opponent": self.opponent,
+            "mode": self.mode,
+            "imported": True,
+            "level": self.level,
+            "base": self.base,
+            "inc": self.inc,
+            "time_control": self.time_control,
+            "fen": board.fen(),
+            "start_fen": self.start_fen,
+            "turn": "white" if board.turn == chess.WHITE else "black",
+            "moves": moves,
+            "last_uci": last_uci,
+            "last_move": ({"from": last_uci[:2], "to": last_uci[2:4]}
+                          if last_uci else None),
+            "legal": {},
+            "can_move": False,
+            "thinking": False,
+            "clocks": self._clocks(),
+            "flagged": None,
+            "over": True,
+            "result": self.result,
+            "result_label": self.record.get("result_label") or "*",
+            "resigned": None,
+            "check": board.is_check(),
+            "check_square": check_square,
+            "eval_cp": eval_cp,
+            "eval_source": self.eval_source,
+            "note": note,
+            "insight": self.insight,
+            "engine_error": self.engine_error,
+            "review_status": status,
+            "review_progress": progress,
+            "review_total": total,
+            "server_ms": int(time.time() * 1000),
+        }
+
+    # ── read-only refusals ─────────────────────────────────────────────────
+    def play(self, uci: str) -> dict[str, Any]:
+        return {"error": "importovaná partie je jen ke čtení"}
+
+    def takeback(self) -> dict[str, Any]:
+        return {"error": "importovaná partie je jen ke čtení"}
+
+    def resign(self) -> dict[str, Any]:
+        return {"error": "importovaná partie je jen ke čtení"}
+
+    # ── review / PGN ───────────────────────────────────────────────────────
+    def start_review(self) -> dict[str, Any]:
+        start = False
+        with self._review_lock:
+            if self.report is None and self.review_status != "running":
+                if self.engine is None:
+                    self.review_status = "error"
+                    self.review_error = "chybí engine pro dopočítání review"
+                else:
+                    self.review_status = "running"
+                    self.review_progress = 0
+                    self.review_total = max(1, len(self.ucis))
+                    self.review_error = None
+                    start = True
+        if start:
+            threading.Thread(target=self._review_worker, daemon=True,
+                             name=f"review-{self.gid}").start()
+        return self.review_payload()
+
+    def _review_progress(self, done: int, total: int) -> None:
+        with self._review_lock:
+            self.review_progress = done
+            self.review_total = max(1, total)
+
+    def _review_worker(self) -> None:
+        try:
+            engine = self.engine
+            if engine is None:
+                raise RuntimeError("chybí engine pro dopočítání review")
+            report = review.analyse_game(chess.Board(self.start_fen), self.ucis,
+                                         self.player_color, engine,
+                                         depth=self.review_depth,
+                                         progress=self._review_progress)
+            report["player"] = self.player
+            report["mode"] = "import"
+            report["result"] = self.result
+            report["time_control"] = self.time_control
+            report["opponent"] = self.opponent
+            report["eval_source"] = "engine"
+            with self._review_lock:
+                self.report = report
+                self.review_status = "ready"
+                self.review_progress = max(1, len(self.ucis))
+        except Exception as exc:  # pragma: no cover - engine failure
+            with self._review_lock:
+                self.review_status = "error"
+                self.review_error = str(exc)
+
+    def review_payload(self) -> dict[str, Any]:
+        with self._review_lock:
+            total = max(1, self.review_total)
+            return {
+                "status": self.review_status,
+                "progress": round(min(1.0, self.review_progress / total), 3),
+                "report": self.report,
+                "error": self.review_error,
+            }
+
+    def pgn(self) -> str:
+        other = self.opponent or "soupeř"
+        white = self.player if self.my_color == "white" else other
+        black = self.player if self.my_color == "black" else other
+        return review.build_pgn(
+            self.start_fen, self.ucis, result=self.result, white=white,
+            black=black, time_control=self.time_control, mode="import")

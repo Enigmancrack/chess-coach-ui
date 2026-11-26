@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Sequence
@@ -258,6 +259,131 @@ def analyse_game(start_board: chess.Board, ucis: Sequence[str],
     return report
 
 
+def report_from_evals(start_fen: str, ucis: Sequence[str],
+                      player_color: chess.Color,
+                      evals: Sequence[int | None], *,
+                      book_plies: int = 10,
+                      pair_sampled: bool = False) -> dict[str, Any]:
+    """Build a full review from evaluations that were already recorded.
+
+    No engine is touched: the journal carries one evaluation per move (white's
+    point of view after conversion), so the review is the same shape
+    `analyse_game` produces — plies with both fens, the white-perspective
+    curve, centipawn losses and the accuracy — only read, not measured again.
+    A move has no "best" alternative here (the journal never recorded one), so
+    `best`/`best_uci` stay None and the UI draws only the played move.
+
+    `pair_sampled` covers the bot's actual journal: it samples the eval before
+    each of *our* moves, so a sample gap spans our move plus the opponent's
+    reply. The loss of our move is then taken between consecutive samples and
+    the report says so (`sampling: "our_turn"`) instead of pretending the
+    number is a clean post-move measurement.
+    """
+    board = chess.Board(start_fen)
+    frames: list[dict[str, Any]] = []
+    for index, raw in enumerate(ucis):
+        try:
+            move = chess.Move.from_uci(str(raw))
+        except ValueError:
+            break
+        if move not in board.legal_moves:
+            break
+        before_board = board.copy()
+        san = board.san(move)
+        flags = rules.move_flags(before_board, move)
+        board.push(move)
+        frames.append({
+            "ply": index + 1,
+            "san": san,
+            "uci": move.uci(),
+            "color": "white" if before_board.turn == chess.WHITE else "black",
+            "fen_before": before_board.fen(),
+            "fen_after": board.fen(),
+            "flags": flags,
+            "only_move": before_board.legal_moves.count() == 1,
+        })
+
+    curve: list[int] = []
+    for value in evals:
+        curve.append(int(value) if isinstance(value, int) else 0)
+    while len(curve) < len(frames) + 1:
+        curve.append(curve[-1] if curve else 0)
+
+    player_side = "white" if player_color == chess.WHITE else "black"
+
+    def mover_cp(white_pov: int, color: str) -> int:
+        return white_pov if color == "white" else -white_pov
+
+    decision = [frame["ply"] - 1 for frame in frames
+                if frame["color"] == player_side]
+    loss_by_index: dict[int, int] = {}
+    for position, index in enumerate(decision):
+        if pair_sampled:
+            following = (decision[position + 1] if position + 1 < len(decision)
+                         else len(frames))
+        else:
+            following = index + 1
+        color = frames[index]["color"]
+        before = mover_cp(curve[index], color)
+        after = mover_cp(curve[min(following, len(curve) - 1)], color)
+        loss_by_index[index] = min(2000, max(0, before - after))
+
+    plies: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for index, frame in enumerate(frames):
+        is_player = frame["color"] == player_side
+        loss = loss_by_index.get(index, 0)
+        turn_color = frame["color"]
+        rec: dict[str, Any] = {
+            "ply": frame["ply"],
+            "san": frame["san"],
+            "uci": frame["uci"],
+            "color": turn_color,
+            "loss": loss,
+            "eval_before": mover_cp(curve[index], turn_color),
+            "eval_after": mover_cp(curve[index + 1], turn_color),
+            "best": None,
+            "best_uci": None,
+            "only_move": frame["only_move"],
+            "book": index < book_plies and loss <= 20,
+            "sacrifice": False,
+            "missed_win": False,
+            "capture": frame["flags"]["capture"],
+            "flags": frame["flags"],
+        }
+        verdict = classify(rec) if is_player else None
+        text = coach_sentence(rec) if is_player else None
+        plies.append({
+            "ply": frame["ply"],
+            "san": frame["san"],
+            "uci": frame["uci"],
+            "color": turn_color,
+            "fen_before": frame["fen_before"],
+            "fen_after": frame["fen_after"],
+            "eval_before": curve[index],
+            "eval_after": curve[index + 1],
+            "flags": frame["flags"],
+            "best": None,
+            "best_uci": None,
+            "verdict": verdict,
+            "loss": loss if is_player else None,
+            "text": text,
+        })
+        if is_player:
+            records.append(rec)
+
+    report = summarise(records)
+    report.update({
+        "start_fen": chess.Board(start_fen).fen(),
+        "player_color": player_side,
+        "plies": plies,
+        "evals": curve[:len(plies) + 1],
+        "eval_source": "stored",
+        "sampling": "our_turn" if pair_sampled else "every_move",
+    })
+    return report
+
+
 def summarise(records: List[dict[str, Any]]) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for rec in records:
@@ -321,17 +447,60 @@ def _load(path: Path) -> dict[str, Any]:
         return {}
 
 
+def model_file() -> Path:
+    return Path(os.environ.get("COACH_MODEL_FILE") or MODEL_FILE)
+
+
+def _top_label(scores: Any, minimum: float = 0.0) -> str | None:
+    """Name of the strongest non-zero entry in a {label: score} dict."""
+    if not isinstance(scores, dict):
+        return None
+    best: str | None = None
+    best_value = minimum
+    for name, value in scores.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number > best_value:
+            best, best_value = str(name), number
+    return best
+
+
 def opponent_insight(name: str) -> dict[str, Any]:
-    data = _load(MODEL_FILE)
+    """What the bot's opponent model remembers about `name` (read-only).
+
+    The model file belongs to the bot; this only reads it.  Both layouts are
+    accepted (a flat ``{player: entry}`` map and ``{"opponents": {...}}``) and
+    the stored score dictionaries are reduced to one readable style/weakness
+    label so the UI does not have to know the model's schema.
+    """
+    if not name:
+        return {}
+    data = _load(model_file())
     players = data.get("opponents") if isinstance(data.get("opponents"), dict) else data
     entry = players.get(name) if isinstance(players, dict) else None
     if not isinstance(entry, dict):
         return {}
-    out: dict[str, Any] = {}
-    for key in ("games", "wins", "losses", "draws", "style", "weakness",
-                "elo_estimate", "elo_variance"):
+    out: dict[str, Any] = {"source": "bot-model", "read_only": True}
+    for key in ("games", "wins", "losses", "draws", "encounters", "style",
+                "weakness", "elo_estimate", "elo_variance", "avg_game_len",
+                "blunders", "psych_tilt_label"):
         if key in entry:
             out[key] = entry[key]
+    if not out.get("style"):
+        style = _top_label(entry.get("style_scores"))
+        if style:
+            out["style"] = style
+    if not out.get("weakness"):
+        weakness = _top_label(entry.get("weaknesses"))
+        if weakness:
+            out["weakness"] = weakness
+    if not out.get("style") and str(entry.get("psych_style") or "") not in ("", "unknown"):
+        out["style"] = str(entry["psych_style"])
+    out["available"] = bool(out.get("games") or out.get("style")
+                            or out.get("weakness")
+                            or out.get("elo_estimate"))
     return out
 
 

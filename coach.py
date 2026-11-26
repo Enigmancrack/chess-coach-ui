@@ -3,6 +3,8 @@
     python3 coach.py play --level 8 --player viktor
     python3 coach.py review            # poslední partie
     python3 coach.py review file.json  # konkrétní
+    python3 coach.py import ~/.chess_bot_journals/123.jsonl
+    python3 coach.py games             # importované partie
 
 Moves are typed as SAN (Nf3) or UCI (g1f3); `quit` ends the game early.
 """
@@ -17,6 +19,7 @@ from typing import Any
 
 import chess
 
+import importer
 import review
 import rules
 from data import default_store
@@ -199,6 +202,109 @@ def review_file(path: Path) -> int:
     return 0
 
 
+def _insight_line(insight: dict[str, Any]) -> str:
+    """One readable line from the bot's (read-only) opponent model entry."""
+    if not insight or not insight.get("available"):
+        return "  model si o soupeři nic nepamatuje."
+    bits: list[str] = []
+    elo = insight.get("elo_estimate")
+    if elo:
+        variance = insight.get("elo_variance")
+        bits.append(f"elo≈{elo}" + (f" (σ {variance})" if variance else ""))
+    if insight.get("style"):
+        bits.append(f"styl {insight['style']}")
+    if insight.get("weakness"):
+        bits.append(f"slabina {insight['weakness']}")
+    games = insight.get("games")
+    if games:
+        bits.append(f"{games} partií ({insight.get('wins', 0)}-"
+                    f"{insight.get('losses', 0)}-{insight.get('draws', 0)})")
+    elif elo:
+        bits.append("bez sehrávek — jen odhad")
+    body = ", ".join(bits) if bits else "jen prázdný záznam"
+    return f"  model si o soupeři myslí (read-only z botu): {body}"
+
+
+def print_import(record: dict[str, Any]) -> None:
+    width = 46
+    report = record.get("report") if isinstance(record.get("report"), dict) else {}
+    print("\n" + "=" * width)
+    print(f"  IMPORT  {Path(str(record.get('source_path') or '?')).name}")
+    print("=" * width)
+    rating = record.get("opponent_rating")
+    who = f"{record.get('player')} ({record.get('my_color')})"
+    other = record.get("opponent") or "soupeř"
+    if rating:
+        other = f"{other} ({rating})"
+    print(f"  {who} vs {other}")
+    print(f"  datum  {record.get('date')}   ·   čas {record.get('time_control')}")
+    moves = len(record.get("ucis") or [])
+    word = "tah" if moves == 1 else ("tahy" if 2 <= moves <= 4 else "tahů")
+    print(f"  výsledek {record.get('result')} ({record.get('result_label')})"
+          f"   ·   {moves} {word}"
+          + (f"   ·   {record['termination']}" if record.get("termination") else ""))
+    if report:
+        source = {"journal": "z deníku", "review": "z uložené partie",
+                  "engine": "Stockfish"}.get(str(record.get("eval_source")), "?")
+        note = (" — eval před tvými tahy" if report.get("sampling") == "our_turn"
+                else "")
+        print(f"  review {source}{note}   ·   přesnost "
+              f"{float(report.get('accuracy') or 0):.1f} %"
+              f"   ·   průměrná ztráta {report.get('avg_loss', 0)} cp")
+        counts = report.get("counts") or {}
+        if counts:
+            pills = "  ".join(f"{_paint(name, ICON.get(name, '') + name)} {count}"
+                              for name, count in
+                              sorted(counts.items(), key=lambda kv: -kv[1]))
+            print(f"  {pills}")
+        for worst in (report.get("worst") or [])[:3]:
+            better = f" lepší: {worst['best']}" if worst.get("best") else ""
+            print(f"   ply {worst.get('ply', 0):>3}  {str(worst.get('san')):<6}"
+                  f" {str(worst.get('verdict')):<11} −{worst.get('loss', 0)} cp{better}")
+    else:
+        print("  review není v datech — otevři partii v aplikaci, dopočítá Stockfish")
+    print(_insight_line(record.get("insight") or {}))
+    print("=" * width)
+
+
+def import_game(raw: str) -> int:
+    try:
+        record = importer.import_path(raw)
+    except importer.ImportRejected as exc:
+        print(f"  odmítnuto: {exc}")
+        return 1
+    except FileNotFoundError as exc:
+        print(f"  {exc}")
+        return 1
+    except ValueError as exc:
+        print(f"  import selhal: {exc}")
+        return 1
+    print_import(record)
+    print(f"  uloženo: {importer.imports_dir() / (str(record['id']) + '.json')}")
+    return 0
+
+
+def list_imports() -> int:
+    rows = importer.list_games()
+    if not rows:
+        print(f"  žádné importované partie ({importer.imports_dir()})")
+        print("  naimportuj: python3 coach.py import "
+              "~/.chess_bot_journals/<game>.jsonl")
+        return 0
+    header = f"  {'datum':<16} {'výsledek':<9} {'tahy':>4} {'přesnost':>8}  soupeř"
+    print("\n" + header)
+    print("  " + "-" * (len(header) - 2))
+    for row in rows:
+        accuracy = row.get("accuracy")
+        acc = f"{float(accuracy):.1f} %" if isinstance(accuracy, (int, float)) else "—"
+        other = (row.get("opponent") or "—")[:24]
+        print(f"  {str(row.get('date') or '')[:16]:<16} "
+              f"{str(row.get('result') or '*'):<9} "
+              f"{int(row.get('moves') or 0):>4} {acc:>8}  {other}")
+    print(f"\n  {len(rows)} partií · {importer.imports_dir()}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="coach")
     sub = parser.add_subparsers(dest="cmd")
@@ -208,6 +314,9 @@ def main(argv: list[str] | None = None) -> int:
     play_cmd.add_argument("--color", choices=("white", "black"), default="white")
     review_cmd = sub.add_parser("review", help="review uložené partie")
     review_cmd.add_argument("file", nargs="?")
+    import_cmd = sub.add_parser("import", help="naimportovat partii bota")
+    import_cmd.add_argument("file", help=".jsonl deník nebo .json partie")
+    sub.add_parser("games", help="seznam importovaných partií")
     args = parser.parse_args(argv)
 
     if args.cmd == "review":
@@ -222,6 +331,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"soubor neexistuje: {path}")
             return 1
         return review_file(path)
+
+    if args.cmd == "import":
+        return import_game(args.file)
+
+    if args.cmd == "games":
+        return list_imports()
 
     if args.cmd == "play":
         if not Path(STOCKFISH).exists():

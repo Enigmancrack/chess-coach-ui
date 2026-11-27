@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 import chess
 
 import game as game_mod
+import i18n
 import importer
 from engine import DEFAULT_STOCKFISH, StockfishEngine
 
@@ -33,6 +34,19 @@ MAX_GAMES = 40
 ENGINE = StockfishEngine(STOCKFISH)
 GAMES: dict[str, Any] = {}
 GAMES_LOCK = threading.Lock()
+# Server-wide default language; per-request `lang` (query/body) wins.
+SETTINGS: dict[str, Any] = {"lang": i18n.resolve()}
+
+
+def current_lang() -> str:
+    return str(SETTINGS["lang"])
+
+
+def body_lang(body: dict[str, Any]) -> str:
+    value = body.get("lang")
+    if isinstance(value, str) and i18n.is_lang(value):
+        return value
+    return current_lang()
 
 
 def get_game(gid: str) -> Any | None:
@@ -45,7 +59,7 @@ def get_game(gid: str) -> Any | None:
     record = importer.get(gid)
     if record is None:
         return None
-    game = game_mod.ImportedGame(record, ENGINE)
+    game = game_mod.ImportedGame(record, ENGINE, lang=current_lang())
     put_game(gid, game)
     return game
 
@@ -80,6 +94,7 @@ def _int(value: Any, default: int, low: int, high: int) -> int:
 
 
 def new_game(body: dict[str, Any]) -> dict[str, Any]:
+    lang = body_lang(body)
     color = str(body.get("color") or "white").lower()
     if color not in ("white", "black", "random"):
         color = "white"
@@ -94,7 +109,8 @@ def new_game(body: dict[str, Any]) -> dict[str, Any]:
             if not board.is_valid():
                 raise ValueError("invalid fen")
         except ValueError as exc:
-            raise ValueError(f"neplatná FEN: {exc}") from exc
+            raise ValueError(i18n.t("errors.invalid_fen", lang,
+                                    error=exc)) from exc
     gid = uuid.uuid4().hex[:10]
     game = game_mod.Game(
         gid,
@@ -106,6 +122,7 @@ def new_game(body: dict[str, Any]) -> dict[str, Any]:
         inc=_int(body.get("inc"), 0, 0, 180),
         mode=str(body.get("mode") or "training"),
         fen=fen if isinstance(fen, str) else None,
+        lang=lang,
     )
     put_game(gid, game)
     game.start()
@@ -163,6 +180,10 @@ class Handler(SimpleHTTPRequestHandler):
         values = parse_qs(urlparse(self.path).query).get(name)
         return values[0] if values else ""
 
+    def _lang(self) -> str:
+        value = self._query("lang")
+        return value if i18n.is_lang(value) else current_lang()
+
     # ── GET ────────────────────────────────────────────────────────────────
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         path = urlparse(self.path).path
@@ -176,6 +197,11 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/themes":
             self._json(themes())
             return
+        if path == "/api/settings":
+            lang = current_lang()
+            self._json({"lang": lang, "langs": list(i18n.LANGS),
+                        "labels": i18n.category_labels(lang)})
+            return
         if path == "/api/games":
             self._json({
                 "games": importer.list_games(),
@@ -187,28 +213,32 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/state":
             game = get_game(self._query("gid"))
             if game is None:
-                self._json({"error": "neznámá partie"}, HTTPStatus.NOT_FOUND)
+                self._json({"error": i18n.t("errors.unknown_game", self._lang())},
+                           HTTPStatus.NOT_FOUND)
                 return
             self._json(game.state())
             return
         if path == "/api/review":
             game = get_game(self._query("gid"))
             if game is None:
-                self._json({"error": "neznámá partie"}, HTTPStatus.NOT_FOUND)
+                self._json({"error": i18n.t("errors.unknown_game", self._lang())},
+                           HTTPStatus.NOT_FOUND)
                 return
             self._json(game.review_payload())
             return
         if path == "/api/pgn":
             game = get_game(self._query("gid"))
             if game is None:
-                self._json({"error": "neznámá partie"}, HTTPStatus.NOT_FOUND)
+                self._json({"error": i18n.t("errors.unknown_game", self._lang())},
+                           HTTPStatus.NOT_FOUND)
                 return
             self._text(game.pgn(), "application/x-chess-pgn; charset=utf-8",
                        extra={"Content-Disposition":
                               f'attachment; filename="chess-coach-{game.gid}.pgn"'})
             return
         if path.startswith("/api/"):
-            self._json({"error": "neznámý endpoint"}, HTTPStatus.NOT_FOUND)
+            self._json({"error": i18n.t("errors.unknown_endpoint", self._lang())},
+                       HTTPStatus.NOT_FOUND)
             return
         super().do_GET()
 
@@ -216,6 +246,17 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         body = self._body()
+        if path == "/api/settings":
+            value = body.get("lang")
+            if not i18n.is_lang(value):
+                self._json({"error": i18n.t("errors.unknown_language",
+                                            body_lang(body), value=value)},
+                           HTTPStatus.BAD_REQUEST)
+                return
+            SETTINGS["lang"] = value
+            self._json({"lang": value, "langs": list(i18n.LANGS),
+                        "labels": i18n.category_labels(value)})
+            return
         if path == "/api/new":
             try:
                 self._json(new_game(body))
@@ -226,7 +267,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "/api/review"):
             game = get_game(str(body.get("gid") or ""))
             if game is None:
-                self._json({"error": "neznámá partie"}, HTTPStatus.NOT_FOUND)
+                self._json({"error": i18n.t("errors.unknown_game", self._lang())},
+                           HTTPStatus.NOT_FOUND)
                 return
             if path == "/api/move":
                 out = game.play(str(body.get("uci") or ""))
@@ -248,7 +290,8 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/import":
             raw = body.get("path")
             if not isinstance(raw, str) or not raw.strip():
-                self._json({"error": "chybí cesta k partii"},
+                self._json({"error": i18n.t("errors.missing_game_path",
+                                               body_lang(body))},
                            HTTPStatus.BAD_REQUEST)
                 return
             try:
@@ -262,7 +305,8 @@ class Handler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
-            imported = game_mod.ImportedGame(record, ENGINE)
+            imported = game_mod.ImportedGame(record, ENGINE,
+                                             lang=body_lang(body))
             put_game(imported.gid, imported)
             self._json({
                 "ok": True,
@@ -271,28 +315,33 @@ class Handler(SimpleHTTPRequestHandler):
                 "state": imported.state(),
             })
             return
-        self._json({"error": "neznámý endpoint"}, HTTPStatus.NOT_FOUND)
+        self._json({"error": i18n.t("errors.unknown_endpoint", self._lang())},
+                       HTTPStatus.NOT_FOUND)
 
 
 def main(argv: list[str] | None = None) -> int:
     global ENGINE, STOCKFISH
-    parser = argparse.ArgumentParser(description="Lokální šachový kouč")
+    parser = argparse.ArgumentParser(description=i18n.t("server.description"))
+    parser.add_argument("--lang", choices=i18n.LANGS, default=None,
+                        help=i18n.t("cli.help_lang"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--stockfish", default=STOCKFISH)
     args = parser.parse_args(argv)
 
     STOCKFISH = args.stockfish
+    SETTINGS["lang"] = i18n.resolve(args.lang)
     ENGINE = StockfishEngine(STOCKFISH)
     if not Path(STOCKFISH).exists():
-        print(f"Stockfish nenalezen: {STOCKFISH}\nNastav COACH_STOCKFISH.")
+        print(i18n.t("errors.stockfish_missing", current_lang(), path=STOCKFISH)
+              + "\n" + i18n.t("errors.env_hint", current_lang()))
         return 2
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
     host, port = server.server_address[:2]
-    print(f"chess-coach-ui na http://{host}:{port}  (engine {STOCKFISH})",
-          flush=True)
+    print(i18n.t("server.start", current_lang(), host=host, port=port,
+                 engine=STOCKFISH), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

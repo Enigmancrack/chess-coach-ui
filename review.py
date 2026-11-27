@@ -18,23 +18,13 @@ from typing import Any, Callable, Iterable, List, Sequence
 import chess
 import chess.pgn
 
+import i18n
 import rules
 from engine import EngineLike, Line
 
 MATE_CP = rules.MATE_CP
 CATEGORIES = ("brilliant", "great", "best", "good", "book",
               "inaccuracy", "mistake", "blunder", "miss")
-CATEGORY_CZ = {
-    "brilliant": "brilantní",
-    "great": "skvělý",
-    "best": "nejlepší",
-    "good": "dobrý",
-    "book": "teorie",
-    "inaccuracy": "nepřesnost",
-    "mistake": "chyba",
-    "blunder": "hrubka",
-    "miss": "promarněná výhra",
-}
 
 MODEL_FILE = Path.home() / ".chess_opponent_model.json"
 PROFILE_FILE = Path.home() / ".chess_coach_profile.json"
@@ -95,34 +85,35 @@ def classify(rec: dict[str, Any]) -> str:
     return "blunder"
 
 
-def coach_sentence(rec: dict[str, Any]) -> str:
-    """The one-liner under the badge."""
+def coach_sentence(rec: dict[str, Any], lang: str | None = None) -> str:
+    """The one-liner under the badge, in the coach's language."""
     san = str(rec.get("san") or "?")
     best = rec.get("best")
     loss = int(rec.get("loss") or 0)
-    verdict = rec.get("verdict") or classify(rec)
-    better = (f" Lepší bylo {best} (−{loss} cp)."
+    verdict = str(rec.get("verdict") or classify(rec))
+    better = (i18n.t("coach.better", lang, best=best, loss=loss)
               if best and best != san and loss > 0 else "")
     if verdict == "brilliant":
-        return f"{san} je brilantní oběť — pozice drží."
+        return i18n.t("coach.brilliant", lang, san=san)
     if verdict == "great":
-        return f"{san} je jediný tah, který drží."
+        return i18n.t("coach.great", lang, san=san)
     if verdict == "miss":
-        return f"Promarněná výhra: {san}.{better}"
+        return i18n.t("coach.miss", lang, san=san) + better
     if verdict == "book":
-        return f"{san} je teorie."
+        return i18n.t("coach.book", lang, san=san)
     if verdict == "best":
         if best and best != san:
-            return f"{san} — stejně dobré jako {best}."
-        return f"{san} — přesně podle enginu."
+            return i18n.t("coach.best_equal", lang, san=san, best=best)
+        return i18n.t("coach.best_exact", lang, san=san)
     if verdict == "good":
-        return f"{san} je dobrý tah.{better}"
-    return f"{san} je {CATEGORY_CZ.get(verdict, verdict)}.{better}"
+        return i18n.t("coach.good", lang, san=san) + better
+    label = i18n.category_label(verdict, lang).lower()
+    return i18n.t("coach.generic", lang, san=san, label=label) + better
 
 
 def evaluate_move(board_before: chess.Board, move: chess.Move,
                   before_lines: Sequence[Line], after_lines: Sequence[Line],
-                  ply: int) -> dict[str, Any]:
+                  ply: int, lang: str | None = None) -> dict[str, Any]:
     """Full record for one move. `after_lines` may be empty on a terminal move."""
     best = before_lines[0] if before_lines else None
     best_cp = int(best.cp) if best else 0
@@ -164,18 +155,20 @@ def evaluate_move(board_before: chess.Board, move: chess.Move,
         "flags": flags,
     }
     rec["verdict"] = classify(rec)
-    rec["text"] = coach_sentence(rec)
+    rec["label"] = i18n.category_label(rec["verdict"], lang)
+    rec["text"] = coach_sentence(rec, lang)
     return rec
 
 
 def judge(board: chess.Board, move: chess.Move, engine: EngineLike,
-          depth: int = 10, ply: int = 0) -> dict[str, Any]:
+          depth: int = 10, ply: int = 0,
+          lang: str | None = None) -> dict[str, Any]:
     """Classify one move using two engine calls (handy for the terminal)."""
     before = engine.analyse(board, depth=depth, multipv=2)
     after_board = board.copy()
     after_board.push(move)
     after = engine.analyse(after_board, depth=depth, multipv=1)
-    return evaluate_move(board, move, before, after, ply)
+    return evaluate_move(board, move, before, after, ply, lang)
 
 
 def _terminal_cp(board: chess.Board) -> int:
@@ -194,7 +187,8 @@ def _safe_analyse(board: chess.Board, engine: EngineLike, depth: int,
 def analyse_game(start_board: chess.Board, ucis: Sequence[str],
                  player_color: chess.Color, engine: EngineLike,
                  depth: int = 12,
-                 progress: Callable[[int, int], None] | None = None) -> dict[str, Any]:
+                 progress: Callable[[int, int], None] | None = None,
+                 lang: str | None = None) -> dict[str, Any]:
     """Analyse a whole game once; n+1 engine calls for n plies.
 
     The evaluation after move i is the evaluation before move i+1, so each
@@ -224,7 +218,7 @@ def analyse_game(start_board: chess.Board, ucis: Sequence[str],
                     else _terminal_cp(board))
         evals.append(rules.white_cp(after_cp, board.turn))
         rec = evaluate_move(before_board, move, before_lines, after_lines,
-                            index + 1)
+                            index + 1, lang)
         is_player = before_board.turn == player_color
         plies.append({
             "ply": index + 1,
@@ -240,6 +234,7 @@ def analyse_game(start_board: chess.Board, ucis: Sequence[str],
             "best_uci": rec["best_uci"],
             "verdict": rec["verdict"] if is_player else None,
             "loss": rec["loss"] if is_player else None,
+            "label": rec["label"] if is_player else None,
             "text": rec["text"] if is_player else None,
         })
         if is_player:
@@ -248,7 +243,7 @@ def analyse_game(start_board: chess.Board, ucis: Sequence[str],
         if progress is not None:
             progress(index + 1, total)
 
-    report = summarise(records)
+    report = summarise(records, lang)
     report.update({
         "start_fen": start_board.fen(),
         "player_color": "white" if player_color == chess.WHITE else "black",
@@ -263,7 +258,8 @@ def report_from_evals(start_fen: str, ucis: Sequence[str],
                       player_color: chess.Color,
                       evals: Sequence[int | None], *,
                       book_plies: int = 10,
-                      pair_sampled: bool = False) -> dict[str, Any]:
+                      pair_sampled: bool = False,
+                      lang: str | None = None) -> dict[str, Any]:
     """Build a full review from evaluations that were already recorded.
 
     No engine is touched: the journal carries one evaluation per move (white's
@@ -352,7 +348,8 @@ def report_from_evals(start_fen: str, ucis: Sequence[str],
             "flags": frame["flags"],
         }
         verdict = classify(rec) if is_player else None
-        text = coach_sentence(rec) if is_player else None
+        label = i18n.category_label(verdict, lang) if verdict else None
+        text = coach_sentence(rec, lang) if is_player else None
         plies.append({
             "ply": frame["ply"],
             "san": frame["san"],
@@ -367,12 +364,13 @@ def report_from_evals(start_fen: str, ucis: Sequence[str],
             "best_uci": None,
             "verdict": verdict,
             "loss": loss if is_player else None,
+            "label": label,
             "text": text,
         })
         if is_player:
             records.append(rec)
 
-    report = summarise(records)
+    report = summarise(records, lang)
     report.update({
         "start_fen": chess.Board(start_fen).fen(),
         "player_color": player_side,
@@ -384,7 +382,8 @@ def report_from_evals(start_fen: str, ucis: Sequence[str],
     return report
 
 
-def summarise(records: List[dict[str, Any]]) -> dict[str, Any]:
+def summarise(records: List[dict[str, Any]],
+              lang: str | None = None) -> dict[str, Any]:
     counts: dict[str, int] = {}
     for rec in records:
         name = rec.get("verdict") or classify(rec)
@@ -409,6 +408,7 @@ def summarise(records: List[dict[str, Any]]) -> dict[str, Any]:
         } for r in worst],
         "avg_loss": round(sum(int(r.get("loss") or 0) for r in records)
                           / max(1, len(records)), 1),
+        "labels": {name: i18n.category_label(name, lang) for name in counts},
     }
 
 
@@ -522,18 +522,21 @@ def profile_update(name: str, review: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
-def verdict_sentence(knowledge: dict[str, Any], review: dict[str, Any]) -> str:
+def verdict_sentence(knowledge: dict[str, Any], review: dict[str, Any],
+                     lang: str | None = None) -> str:
     acc = review["accuracy"]
-    band = "čistá" if acc >= 85 else "solidní" if acc >= 70 else "volnější"
-    parts = [f"Přesnost {acc} % ({band})."]
+    band = i18n.t("review.band_clean" if acc >= 85 else
+                  "review.band_solid" if acc >= 70 else "review.band_loose", lang)
+    parts = [i18n.t("review.accuracy", lang, accuracy=acc, band=band)]
     est = knowledge.get("elo_estimate")
     if est:
-        parts.append(f"Model tě odhaduje na {int(est)} Elo.")
+        parts.append(i18n.t("review.model_elo", lang, elo=int(est)))
     weak = knowledge.get("weakness")
     if isinstance(weak, str) and weak and weak not in ("unknown", "none"):
-        parts.append(f"Známá slabina: {weak.replace('_', ' ')}.")
+        parts.append(i18n.t("review.weakness", lang,
+                            weakness=weak.replace("_", " ")))
     if review["counts"].get("blunder", 0) >= 3:
-        parts.append("Tři a více hrubek — příště taktika.")
+        parts.append(i18n.t("review.three_blunders", lang))
     return " ".join(parts)
 
 
@@ -574,7 +577,8 @@ def trends(games: list[dict[str, Any]], window: int = 5) -> dict[str, Any]:
     return out
 
 
-def advice(review: dict[str, Any], window: dict[str, Any] | None = None) -> list[str]:
+def advice(review: dict[str, Any], window: dict[str, Any] | None = None,
+           lang: str | None = None) -> list[str]:
     tips: list[str] = []
     counts = review.get("counts") or {}
     blunders = int(counts.get("blunder", 0))
@@ -582,16 +586,15 @@ def advice(review: dict[str, Any], window: dict[str, Any] | None = None) -> list
     misses = int(counts.get("miss", 0))
     worst = (review.get("worst") or [{}])[0]
     if blunders:
-        tips.append(f"{blunders} hrubek: před každým braním nebo šachem si "
-                    f"řekni, co soupeř bere. Začni tou nejhorší (tah "
-                    f"{worst.get('ply')}, {worst.get('san')} — "
-                    f"{worst.get('best')} bylo lepší).")
+        tips.append(i18n.t("advice.blunders", lang, blunders=blunders,
+                           ply=worst.get("ply"), san=worst.get("san"),
+                           best=worst.get("best")))
     if misses:
-        tips.append("Měl jsi vynucenou výhru a pustil ji — trénuj matové obrazy.")
+        tips.append(i18n.t("advice.missed_win", lang))
     if mistakes >= 2:
-        tips.append(f"{mistakes} chyb: zpomal ve střední hře, jeden kandidát.")
+        tips.append(i18n.t("advice.mistakes", lang, mistakes=mistakes))
     if counts.get("inaccuracy", 0) >= 4:
-        tips.append("Hodně malých nepřesností: kontroluj celou desku každý tah.")
+        tips.append(i18n.t("advice.inaccuracies", lang))
     if not tips:
-        tips.append("Čistá partie. Zvedni úroveň o jedna a hraj stejně.")
+        tips.append(i18n.t("advice.clean", lang))
     return tips

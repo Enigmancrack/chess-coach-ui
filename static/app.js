@@ -51,7 +51,9 @@ const S = {
   setup: {
     color: 'white', base: 300, inc: 0, level: 8,
     mode: 'training', player: 'me'
-  }
+  },
+  lang: 'cs',
+  labels: {}
 };
 
 const MOTION = window.ChessMotion;
@@ -65,6 +67,12 @@ const BOARD_TINT = {
 
 function clamp(value, low, high) {
   return Math.max(low, Math.min(high, value));
+}
+
+/* Category labels come from the server for the chosen language; the ids
+   (best, blunder, ...) never change, so lookups stay language-neutral. */
+function labelOf(name) {
+  return (S.labels && S.labels[name]) || LABEL[name] || name;
 }
 
 function winPercent(cp) {
@@ -498,7 +506,7 @@ function renderMoves(moves) {
       if (move.verdict) {
         const badge = document.createElement('span');
         badge.className = `badge v-${move.verdict}`;
-        badge.textContent = LABEL[move.verdict] || move.verdict;
+        badge.textContent = labelOf(move.verdict);
         badge.title = move.loss !== undefined && move.loss !== null
           ? `ztráta ${move.loss} cp` : '';
         span.appendChild(badge);
@@ -536,7 +544,7 @@ function renderCoach(st) {
   if (note) {
     const badge = document.createElement('span');
     badge.className = `coach-badge v-${note.verdict}`;
-    badge.textContent = LABEL[note.verdict] || note.verdict;
+    badge.textContent = labelOf(note.verdict);
     host.appendChild(badge);
     const text = document.createElement('span');
     text.textContent = note.text;
@@ -1317,7 +1325,7 @@ function renderReview(report) {
     const pill = document.createElement('div');
     pill.className = 'count-pill';
     const label = document.createElement('span');
-    label.textContent = LABEL[name] || name;
+    label.textContent = labelOf(name);
     const value = document.createElement('b');
     value.className = `badge v-${name}`;
     value.textContent = String(count);
@@ -1341,7 +1349,7 @@ function renderReview(report) {
       main.className = 'wmain';
       const badge = document.createElement('span');
       badge.className = `badge v-${item.verdict}`;
-      badge.textContent = LABEL[item.verdict] || item.verdict;
+      badge.textContent = labelOf(item.verdict);
       const text = document.createElement('span');
       text.textContent = `${item.ply}. ${item.san} · −${item.loss} cp`;
       main.append(badge, text);
@@ -1417,7 +1425,7 @@ function jumpToPly(ply) {
     where += ' · výchozí pozice';
   } else {
     where += ` · ${last.san}`;
-    if (last.verdict) where += ` · ${LABEL[last.verdict] || last.verdict}`;
+    if (last.verdict) where += ` · ${labelOf(last.verdict)}`;
     if (last.loss) where += ` · −${last.loss} cp`;
   }
   $('rvWhere').textContent = where;
@@ -1632,7 +1640,8 @@ async function startGame() {
         inc,
         level: S.setup.level,
         mode: S.setup.mode,
-        player: S.setup.player
+        player: S.setup.player,
+        lang: S.lang
       }
     });
     S.orientation = st.my_color;
@@ -1644,6 +1653,20 @@ async function startGame() {
     tickClocks();
   } catch (error) {
     showToast((error.data && error.data.error) || error.message || 'Start selhal');
+  }
+}
+
+async function applyLanguage(lang) {
+  try {
+    const out = await api('api/settings', { method: 'POST', body: { lang } });
+    S.lang = out.lang;
+    S.labels = out.labels || {};
+    $('langSelect').value = S.lang;
+    S.moveSig = '';
+    if (S.st) renderMoves(S.st.moves);
+    if (S.review) renderReview(S.review);
+  } catch (error) {
+    showToast((error.data && error.data.error) || 'Jazyk se nepodařilo změnit');
   }
 }
 
@@ -1851,6 +1874,9 @@ function wire() {
     S.animSpeed = $('animSpeed').value;
     savePrefs();
   });
+  $('langSelect').addEventListener('change', () => {
+    applyLanguage($('langSelect').value);
+  });
   $('soundBtn').addEventListener('click', () => {
     S.soundOn = !S.soundOn;
     $('soundBtn').textContent = S.soundOn ? '🔊' : '🔇';
@@ -1962,6 +1988,14 @@ async function init() {
     turn: 'white', over: true
   });
   tickClocks();
+  try {
+    const settings = await api('api/settings');
+    S.lang = settings.lang;
+    S.labels = settings.labels || {};
+    $('langSelect').value = S.lang;
+  } catch (error) {
+    /* an older server without /api/settings: stay Czech */
+  }
   showSetup();
   await loadThemes();
   loadGames();

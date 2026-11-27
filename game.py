@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 import chess
 
+import i18n
 import review
 import rules
 from clock import BLACK, WHITE, Clock
@@ -27,10 +28,12 @@ class Game:
     def __init__(self, gid: str, engine: EngineLike, *, level: int = 8,
                  player: str = "me", color: str = "white", base: int = 600,
                  inc: int = 0, mode: str = "training", fen: str | None = None,
+                 lang: str | None = None,
                  now: Callable[[], float] = time.monotonic,
                  play_depth: int | None = None,
                  review_depth: int | None = None) -> None:
         self.gid = gid
+        self.lang = i18n.resolve(lang)
         self.engine = engine
         self.player = (player or "me").strip()[:40] or "me"
         self.player_color = chess.BLACK if str(color).lower().startswith("b") else chess.WHITE
@@ -45,7 +48,7 @@ class Game:
 
         self.board = chess.Board(fen or chess.STARTING_FEN)
         if not self.board.is_valid():
-            raise ValueError("neplatná FEN")
+            raise ValueError(i18n.t("errors.invalid_fen_bare", self.lang))
         self.start_fen = self.board.fen()
         self.clock = Clock(self.base, self.inc, now=now)
         self.moves: list[dict[str, Any]] = []
@@ -179,21 +182,23 @@ class Game:
     def play(self, uci: str) -> dict[str, Any]:
         with self.lock:
             if self._is_over_locked():
-                return {"error": "partie už skončila"}
+                return {"error": i18n.t("errors.game_over", self.lang)}
             if self.thinking:
-                return {"error": "engine právě přemýšlí"}
+                return {"error": i18n.t("errors.engine_thinking", self.lang)}
             if not self._is_player_turn_locked():
-                return {"error": "nejsi na tahu",
+                return {"error": i18n.t("errors.not_your_turn", self.lang),
                         "turn": self._side(self.board.turn)}
             move = rules.normalise_uci(self.board, uci)
             if move is None:
-                return {"error": "nelegální tah", "legal": self._legal_locked()}
+                return {"error": i18n.t("errors.illegal_move", self.lang),
+                        "legal": self._legal_locked()}
 
             # Stop the player's clock at the moment the move was received.
             self.clock.settle()
             if self.clock.flagged is not None:
                 self.clock.stop()
-                return {"error": "vypršel čas", "state": self.state()}
+                return {"error": i18n.t("errors.out_of_time", self.lang),
+                        "state": self.state()}
 
             before_board = self.board.copy()
             before_lines = self._analyse(self.board, self.play_depth, 2)
@@ -203,7 +208,8 @@ class Game:
             self.board.push(move)
             after_lines = self._analyse(self.board, self.play_depth, 1)
             rec = review.evaluate_move(before_board, move, before_lines,
-                                       after_lines, len(self.board.move_stack))
+                                       after_lines, len(self.board.move_stack),
+                                       self.lang)
             self.moves.append({
                 "ply": len(self.board.move_stack),
                 "san": san,
@@ -226,11 +232,11 @@ class Game:
     def takeback(self) -> dict[str, Any]:
         with self.lock:
             if self.thinking:
-                return {"error": "počkej, engine přemýšlí"}
+                return {"error": i18n.t("errors.wait_engine", self.lang)}
             if self._is_over_locked():
-                return {"error": "partie už skončila"}
+                return {"error": i18n.t("errors.game_over", self.lang)}
             if not any(m["color"] == self.my_color for m in self.moves):
-                return {"error": "není co vracet"}
+                return {"error": i18n.t("errors.nothing_to_take_back", self.lang)}
 
             removed_player = False
             while self.board.move_stack:
@@ -290,6 +296,7 @@ class Game:
                 "player": self.player,
                 "my_color": self.my_color,
                 "mode": self.mode,
+                "lang": self.lang,
                 "level": self.level,
                 "base": self.base,
                 "inc": self.inc,
@@ -352,7 +359,8 @@ class Game:
         try:
             report = review.analyse_game(chess.Board(fen), ucis, color,
                                          self.engine, depth=depth,
-                                         progress=self._review_progress)
+                                         progress=self._review_progress,
+                                         lang=self.lang)
             with self.lock:
                 report["player"] = self.player
                 report["level"] = self.level
@@ -381,8 +389,9 @@ class Game:
     def pgn(self) -> str:
         with self.lock:
             result = self._result_locked() or "*"
-            white = self.player if self.my_color == "white" else f"Stockfish lvl {self.level}"
-            black = self.player if self.my_color == "black" else f"Stockfish lvl {self.level}"
+            bot = i18n.t("pgn.bot_name", self.lang, level=self.level)
+            white = self.player if self.my_color == "white" else bot
+            black = self.player if self.my_color == "black" else bot
             return review.build_pgn(
                 self.start_fen,
                 [m["uci"] for m in self.moves],
@@ -406,8 +415,10 @@ class ImportedGame:
     """
 
     def __init__(self, record: dict[str, Any],
-                 engine: EngineLike | None = None) -> None:
+                 engine: EngineLike | None = None,
+                 lang: str | None = None) -> None:
         self.record = record
+        self.lang = i18n.resolve(lang)
         self.gid = str(record.get("id") or "")
         self.player = str(record.get("player") or "bot")[:40] or "bot"
         self.my_color = "black" if record.get("my_color") == "black" else "white"
@@ -522,6 +533,7 @@ class ImportedGame:
             "player": self.player,
             "my_color": self.my_color,
             "opponent": self.opponent,
+            "lang": self.lang,
             "mode": self.mode,
             "imported": True,
             "level": self.level,
@@ -559,13 +571,13 @@ class ImportedGame:
 
     # ── read-only refusals ─────────────────────────────────────────────────
     def play(self, uci: str) -> dict[str, Any]:
-        return {"error": "importovaná partie je jen ke čtení"}
+        return {"error": i18n.t("errors.read_only", self.lang)}
 
     def takeback(self) -> dict[str, Any]:
-        return {"error": "importovaná partie je jen ke čtení"}
+        return {"error": i18n.t("errors.read_only", self.lang)}
 
     def resign(self) -> dict[str, Any]:
-        return {"error": "importovaná partie je jen ke čtení"}
+        return {"error": i18n.t("errors.read_only", self.lang)}
 
     # ── review / PGN ───────────────────────────────────────────────────────
     def start_review(self) -> dict[str, Any]:
@@ -574,7 +586,7 @@ class ImportedGame:
             if self.report is None and self.review_status != "running":
                 if self.engine is None:
                     self.review_status = "error"
-                    self.review_error = "chybí engine pro dopočítání review"
+                    self.review_error = i18n.t("errors.review_engine_missing", self.lang)
                 else:
                     self.review_status = "running"
                     self.review_progress = 0
@@ -595,11 +607,12 @@ class ImportedGame:
         try:
             engine = self.engine
             if engine is None:
-                raise RuntimeError("chybí engine pro dopočítání review")
+                raise RuntimeError(i18n.t("errors.review_engine_missing", self.lang))
             report = review.analyse_game(chess.Board(self.start_fen), self.ucis,
                                          self.player_color, engine,
                                          depth=self.review_depth,
-                                         progress=self._review_progress)
+                                         progress=self._review_progress,
+                                         lang=self.lang)
             report["player"] = self.player
             report["mode"] = "import"
             report["result"] = self.result
@@ -626,7 +639,7 @@ class ImportedGame:
             }
 
     def pgn(self) -> str:
-        other = self.opponent or "soupeř"
+        other = self.opponent or i18n.t("common.opponent", self.lang)
         white = self.player if self.my_color == "white" else other
         black = self.player if self.my_color == "black" else other
         return review.build_pgn(

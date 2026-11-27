@@ -7,6 +7,8 @@
     python3 coach.py games             # importované partie
 
 Moves are typed as SAN (Nf3) or UCI (g1f3); `quit` ends the game early.
+Every printed line comes from `i18n`; `--lang {cs,en}` or `COACH_LANG` picks
+the language (Czech by default).
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from typing import Any
 
 import chess
 
+import i18n
 import importer
 import review
 import rules
@@ -57,7 +60,17 @@ def _is_quit(text: str) -> bool:
     return text.strip().lower() in ("quit", "q", "exit", "konec")
 
 
-def play(level: int, player: str, human_color: chess.Color = chess.WHITE) -> int:
+def _label(verdict: str, lang: str) -> str:
+    """Localized display word for a category id (the id itself never changes)."""
+    try:
+        return i18n.category_label(verdict, lang)
+    except KeyError:
+        return verdict
+
+
+def play(level: int, player: str, human_color: chess.Color = chess.WHITE,
+         lang: str | None = None) -> int:
+    lang = i18n.resolve(lang)
     engine = StockfishEngine(STOCKFISH)
     board = chess.Board()
     sans: list[str] = []
@@ -71,29 +84,29 @@ def play(level: int, player: str, human_color: chess.Color = chess.WHITE) -> int
                 sans.append(board.san(reply))
                 ucis.append(reply.uci())
                 board.push(reply)
-                print(f"  soupeř: {sans[-1]}")
+                print(i18n.t("cli.opponent_move", lang, san=sans[-1]))
 
         while not board.is_game_over(claim_draw=True):
             print()
             print(board.unicode(borders=True, orientation=human_color))
-            print("\n  tvůj tah (SAN/UCI), 'quit' ukončí: ", end="", flush=True)
+            print(i18n.t("cli.prompt", lang), end="", flush=True)
             line = sys.stdin.readline()
             if not line or _is_quit(line):
-                print("  konec předčasně")
+                print(i18n.t("cli.ended_early", lang))
                 break
             move = _parse(board, line)
             if move is None:
-                print("  nerozumím / nelegální tah")
+                print(i18n.t("cli.unclear", lang))
                 continue
             rec = review.judge(board, move, engine, depth=play_depth,
-                               ply=len(board.move_stack) + 1)
+                               ply=len(board.move_stack) + 1, lang=lang)
             sans.append(rec["san"])
             ucis.append(move.uci())
             board.push(move)
-            print(f"  {_paint(rec['verdict'], ICON.get(rec['verdict'], '?') + ' '
-                               + rec['verdict'])}  {rec['san']}"
-                  + (f"  (−{rec['loss']} cp, lepší {rec['best']})"
-                     if rec["loss"] else ""))
+            detail = (i18n.t("cli.move_loss", lang, loss=rec["loss"],
+                            best=rec["best"]) if rec["loss"] else "")
+            print(f"  {_paint(rec['verdict'], ICON.get(rec['verdict'], '?') + ' ' + _label(rec['verdict'], lang))}"
+                  f"  {rec['san']}{detail}")
             if board.is_game_over(claim_draw=True):
                 break
             reply = engine.play(board, level)
@@ -102,14 +115,15 @@ def play(level: int, player: str, human_color: chess.Color = chess.WHITE) -> int
             sans.append(board.san(reply))
             ucis.append(reply.uci())
             board.push(reply)
-            print(f"  soupeř: {sans[-1]}")
+            print(i18n.t("cli.opponent_move", lang, san=sans[-1]))
 
         result = (board.result(claim_draw=True)
                   if board.is_game_over(claim_draw=True) else "*")
-        print(f"\n  výsledek: {result}   ({len(ucis)} půltahů)")
-        print("  analyzuji partii…", flush=True)
+        print(i18n.t("cli.result", lang, result=result, plies=len(ucis),
+                     plies_word=i18n.plural("plies", len(ucis), lang)))
+        print(i18n.t("cli.analysing", lang), flush=True)
         report = review.analyse_game(chess.Board(), ucis, human_color,
-                                     engine, depth=review_depth)
+                                     engine, depth=review_depth, lang=lang)
         report.update({"player": player, "level": level, "result": result,
                        "color": "white" if human_color else "black"})
         store = default_store()
@@ -123,8 +137,8 @@ def play(level: int, player: str, human_color: chess.Color = chess.WHITE) -> int
             "when": time.strftime("%Y-%m-%d %H:%M"),
             "review": report,
         })
-        print(f"  uloženo: {path}")
-        print_report(report, player, level, result)
+        print(i18n.t("cli.saved", lang, path=path))
+        print_report(report, player, level, result, lang)
         return 0
     finally:
         engine.close()
@@ -144,37 +158,43 @@ def _ucis_from_sans(sans: list[str]) -> list[str]:
 
 
 def print_report(report: dict[str, Any], player: str, level: int | str,
-                 result: str) -> None:
+                 result: str, lang: str | None = None) -> None:
+    lang = i18n.resolve(lang)
     width = 40
     print("\n" + "=" * width)
-    print(f"  REVIEW  {player}  vs  engine (lvl {level})")
+    print(i18n.t("cli.review_head", lang, player=player, level=level))
     moves = int(report.get("moves") or 0)
-    word = "tah" if moves == 1 else ("tahy" if 2 <= moves <= 4 else "tahů")
-    print(f"  výsledek {result}  ·  {moves} {word}"
-          f"  ·  průměrná ztráta {report.get('avg_loss', 0)} cp")
+    print(i18n.t("cli.review_line", lang, result=result, moves=moves,
+                 moves_word=i18n.plural("moves", moves, lang),
+                 avg=report.get("avg_loss", 0)))
     print("=" * width)
     acc = float(report.get("accuracy") or 0)
     filled = int(round(acc / 100 * 30))
     bar_color = "\033[92m" if acc >= 85 else "\033[93m" if acc >= 70 else "\033[91m"
-    print(f"  přesnost {acc} %  {bar_color}{'█' * filled}{OFF}{'░' * (30 - filled)}")
+    bar = f"{bar_color}{'█' * filled}{OFF}{'░' * (30 - filled)}"
+    print(i18n.t("cli.accuracy_bar", lang, accuracy=acc, bar=bar))
     print()
     counts = report.get("counts") or {}
     for name, count in sorted(counts.items(), key=lambda kv: -kv[1]):
-        print(f"  {_paint(name, (ICON.get(name, '') + ' ' + name).ljust(16))} {count}")
+        print(f"  {_paint(name, (ICON.get(name, '') + ' ' + _label(name, lang)).ljust(16))} {count}")
     worst = report.get("worst") or []
     if worst:
-        print("\n  nejhorší momenty:")
+        print(i18n.t("cli.worst_head", lang))
         for w in worst:
-            better = f" lepší: {w['best']}" if w.get("best") else ""
-            print(f"   ply {w.get('ply', 0):>3}  {str(w.get('san')):<6}"
-                  f" {str(w.get('verdict')):<11} −{w.get('loss', 0)} cp{better}")
+            better = (i18n.t("cli.better", lang, best=w["best"])
+                      if w.get("best") else "")
+            print(i18n.t("cli.worst_line", lang, ply=w.get("ply", 0),
+                         san=str(w.get("san")), loss=w.get("loss", 0),
+                         verdict=_label(str(w.get("verdict")), lang),
+                         better=better))
     knowledge = review.opponent_insight(player)
-    print("\n  " + review.verdict_sentence(knowledge, report))
+    print("\n  " + review.verdict_sentence(knowledge, report, lang))
     print("=" * width)
     review.profile_update(player or "me", report)
 
 
-def review_file(path: Path) -> int:
+def review_file(path: Path, lang: str | None = None) -> int:
+    lang = i18n.resolve(lang)
     store = default_store()
     data = store.load(path)
     player = str(data.get("player") or "me")
@@ -187,7 +207,7 @@ def review_file(path: Path) -> int:
             sans = data.get("sans")
             ucis = _ucis_from_sans(sans) if isinstance(sans, list) else []
         if not Path(STOCKFISH).exists():
-            print(f"Stockfish nenalezen: {STOCKFISH}")
+            print(i18n.t("errors.stockfish_missing", lang, path=STOCKFISH))
             return 2
         engine = StockfishEngine(STOCKFISH)
         try:
@@ -195,103 +215,127 @@ def review_file(path: Path) -> int:
             report = review.analyse_game(chess.Board(), [str(u) for u in ucis],
                                          color, engine,
                                          depth=int(os.environ.get(
-                                             "COACH_REVIEW_DEPTH", "10")))
+                                             "COACH_REVIEW_DEPTH", "10")),
+                                         lang=lang)
         finally:
             engine.close()
-    print_report(report, player, level, result)
+    print_report(report, player, level, result, lang)
     return 0
 
 
-def _insight_line(insight: dict[str, Any]) -> str:
+def _insight_line(insight: dict[str, Any], lang: str | None = None) -> str:
     """One readable line from the bot's (read-only) opponent model entry."""
     if not insight or not insight.get("available"):
-        return "  model si o soupeři nic nepamatuje."
+        return i18n.t("insight.empty", lang)
     bits: list[str] = []
     elo = insight.get("elo_estimate")
     if elo:
         variance = insight.get("elo_variance")
-        bits.append(f"elo≈{elo}" + (f" (σ {variance})" if variance else ""))
+        bits.append(i18n.t("insight.elo", lang, elo=elo)
+                    + (i18n.t("insight.variance", lang, variance=variance)
+                       if variance else ""))
     if insight.get("style"):
-        bits.append(f"styl {insight['style']}")
+        bits.append(i18n.t("insight.style", lang, style=insight["style"]))
     if insight.get("weakness"):
-        bits.append(f"slabina {insight['weakness']}")
+        bits.append(i18n.t("insight.weakness", lang,
+                           weakness=insight["weakness"]))
     games = insight.get("games")
     if games:
-        bits.append(f"{games} partií ({insight.get('wins', 0)}-"
-                    f"{insight.get('losses', 0)}-{insight.get('draws', 0)})")
+        bits.append(i18n.t("insight.games", lang, count=games,
+                           games=i18n.plural("games", games, lang),
+                           wins=insight.get("wins", 0),
+                           losses=insight.get("losses", 0),
+                           draws=insight.get("draws", 0)))
     elif elo:
-        bits.append("bez sehrávek — jen odhad")
-    body = ", ".join(bits) if bits else "jen prázdný záznam"
-    return f"  model si o soupeři myslí (read-only z botu): {body}"
+        bits.append(i18n.t("insight.estimate_only", lang))
+    body = ", ".join(bits) if bits else i18n.t("insight.blank", lang)
+    return i18n.t("insight.line", lang, body=body)
 
 
-def print_import(record: dict[str, Any]) -> None:
+def print_import(record: dict[str, Any], lang: str | None = None) -> None:
+    lang = i18n.resolve(lang)
     width = 46
     report = record.get("report") if isinstance(record.get("report"), dict) else {}
     print("\n" + "=" * width)
-    print(f"  IMPORT  {Path(str(record.get('source_path') or '?')).name}")
+    print(i18n.t("cli.import_title", lang,
+                 name=Path(str(record.get("source_path") or "?")).name))
     print("=" * width)
     rating = record.get("opponent_rating")
     who = f"{record.get('player')} ({record.get('my_color')})"
-    other = record.get("opponent") or "soupeř"
+    other = record.get("opponent") or i18n.t("common.opponent", lang)
     if rating:
         other = f"{other} ({rating})"
-    print(f"  {who} vs {other}")
-    print(f"  datum  {record.get('date')}   ·   čas {record.get('time_control')}")
+    print(i18n.t("cli.import_who", lang, who=who, other=other))
+    print(i18n.t("cli.import_date", lang, date=record.get("date"),
+                 time_control=record.get("time_control")))
     moves = len(record.get("ucis") or [])
-    word = "tah" if moves == 1 else ("tahy" if 2 <= moves <= 4 else "tahů")
-    print(f"  výsledek {record.get('result')} ({record.get('result_label')})"
-          f"   ·   {moves} {word}"
-          + (f"   ·   {record['termination']}" if record.get("termination") else ""))
+    line = i18n.t("cli.import_result", lang, result=record.get("result"),
+                  label=record.get("result_label"), moves=moves,
+                  moves_word=i18n.plural("moves", moves, lang))
+    if record.get("termination"):
+        line += i18n.t("cli.import_termination", lang,
+                       termination=record["termination"])
+    print(line)
     if report:
-        source = {"journal": "z deníku", "review": "z uložené partie",
-                  "engine": "Stockfish"}.get(str(record.get("eval_source")), "?")
-        note = (" — eval před tvými tahy" if report.get("sampling") == "our_turn"
-                else "")
-        print(f"  review {source}{note}   ·   přesnost "
-              f"{float(report.get('accuracy') or 0):.1f} %"
-              f"   ·   průměrná ztráta {report.get('avg_loss', 0)} cp")
+        source = {"journal": i18n.t("cli.source_journal", lang),
+                  "review": i18n.t("cli.source_stored", lang),
+                  "engine": i18n.t("cli.source_engine", lang)}.get(
+                      str(record.get("eval_source")), "?")
+        note = (i18n.t("cli.eval_note", lang)
+                if report.get("sampling") == "our_turn" else "")
+        print(i18n.t("cli.import_review", lang, source=source, note=note,
+                     accuracy=float(report.get("accuracy") or 0),
+                     avg=report.get("avg_loss", 0)))
         counts = report.get("counts") or {}
         if counts:
-            pills = "  ".join(f"{_paint(name, ICON.get(name, '') + name)} {count}"
-                              for name, count in
-                              sorted(counts.items(), key=lambda kv: -kv[1]))
+            pills = "  ".join(
+                f"{_paint(name, ICON.get(name, '') + ' ' + _label(name, lang))} {count}"
+                for name, count in sorted(counts.items(), key=lambda kv: -kv[1]))
             print(f"  {pills}")
         for worst in (report.get("worst") or [])[:3]:
-            better = f" lepší: {worst['best']}" if worst.get("best") else ""
-            print(f"   ply {worst.get('ply', 0):>3}  {str(worst.get('san')):<6}"
-                  f" {str(worst.get('verdict')):<11} −{worst.get('loss', 0)} cp{better}")
+            better = (i18n.t("cli.better", lang, best=worst["best"])
+                      if worst.get("best") else "")
+            print(i18n.t("cli.worst_line", lang, ply=worst.get("ply", 0),
+                         san=str(worst.get("san")), loss=worst.get("loss", 0),
+                         verdict=_label(str(worst.get("verdict")), lang),
+                         better=better))
     else:
-        print("  review není v datech — otevři partii v aplikaci, dopočítá Stockfish")
-    print(_insight_line(record.get("insight") or {}))
+        print(i18n.t("cli.import_no_review", lang))
+    print(_insight_line(record.get("insight") or {}, lang))
     print("=" * width)
 
 
-def import_game(raw: str) -> int:
+def import_game(raw: str, lang: str | None = None) -> int:
+    lang = i18n.resolve(lang)
     try:
         record = importer.import_path(raw)
     except importer.ImportRejected as exc:
-        print(f"  odmítnuto: {exc}")
+        print(i18n.t("cli.rejected", lang, error=exc))
         return 1
     except FileNotFoundError as exc:
-        print(f"  {exc}")
+        print(i18n.t("cli.error_line", lang, error=exc))
         return 1
     except ValueError as exc:
-        print(f"  import selhal: {exc}")
+        print(i18n.t("cli.import_failed", lang, error=exc))
         return 1
-    print_import(record)
-    print(f"  uloženo: {importer.imports_dir() / (str(record['id']) + '.json')}")
+    print_import(record, lang)
+    print(i18n.t("cli.saved", lang,
+                 path=importer.imports_dir() / (str(record["id"]) + ".json")))
     return 0
 
 
-def list_imports() -> int:
+def list_imports(lang: str | None = None) -> int:
+    lang = i18n.resolve(lang)
     rows = importer.list_games()
     if not rows:
-        print(f"  žádné importované partie ({importer.imports_dir()})")
-        print("  naimportuj: python3 coach.py import "
-              "~/.chess_bot_journals/<game>.jsonl")
+        print(i18n.t("cli.no_imports", lang, dir=importer.imports_dir()))
+        print(i18n.t("cli.import_hint", lang))
         return 0
-    header = f"  {'datum':<16} {'výsledek':<9} {'tahy':>4} {'přesnost':>8}  soupeř"
+    header = (f"  {i18n.t('cli.list_date', lang):<16} "
+              f"{i18n.t('cli.list_result', lang):<9} "
+              f"{i18n.t('cli.list_moves', lang):>4} "
+              f"{i18n.t('cli.list_accuracy', lang):>8}  "
+              f"{i18n.t('cli.list_opponent', lang)}")
     print("\n" + header)
     print("  " + "-" * (len(header) - 2))
     for row in rows:
@@ -301,23 +345,32 @@ def list_imports() -> int:
         print(f"  {str(row.get('date') or '')[:16]:<16} "
               f"{str(row.get('result') or '*'):<9} "
               f"{int(row.get('moves') or 0):>4} {acc:>8}  {other}")
-    print(f"\n  {len(rows)} partií · {importer.imports_dir()}")
+    print(i18n.t("cli.list_footer", lang, count=len(rows),
+                 games_word=i18n.plural("games", len(rows), lang),
+                 dir=importer.imports_dir()))
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="coach")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--lang", choices=i18n.LANGS, default=None,
+                        help=i18n.t("cli.help_lang"))
+    parser = argparse.ArgumentParser(prog="coach", parents=[common])
     sub = parser.add_subparsers(dest="cmd")
-    play_cmd = sub.add_parser("play", help="hrát partii a dostat review")
+    play_cmd = sub.add_parser("play", parents=[common],
+                              help=i18n.t("cli.help_play"))
     play_cmd.add_argument("--level", type=int, default=8)
     play_cmd.add_argument("--player", default="me")
     play_cmd.add_argument("--color", choices=("white", "black"), default="white")
-    review_cmd = sub.add_parser("review", help="review uložené partie")
+    review_cmd = sub.add_parser("review", parents=[common],
+                                help=i18n.t("cli.help_review"))
     review_cmd.add_argument("file", nargs="?")
-    import_cmd = sub.add_parser("import", help="naimportovat partii bota")
-    import_cmd.add_argument("file", help=".jsonl deník nebo .json partie")
-    sub.add_parser("games", help="seznam importovaných partií")
+    import_cmd = sub.add_parser("import", parents=[common],
+                                help=i18n.t("cli.help_import"))
+    import_cmd.add_argument("file", help=i18n.t("cli.help_import_file"))
+    sub.add_parser("games", parents=[common], help=i18n.t("cli.help_games"))
     args = parser.parse_args(argv)
+    lang = i18n.resolve(args.lang)
 
     if args.cmd == "review":
         if args.file:
@@ -325,25 +378,26 @@ def main(argv: list[str] | None = None) -> int:
         else:
             path = default_store().latest()
         if path is None:
-            print("žádná uložená partie")
+            print(i18n.t("cli.no_saved_game", lang))
             return 1
         if not path.exists():
-            print(f"soubor neexistuje: {path}")
+            print(i18n.t("cli.file_missing", lang, path=path))
             return 1
-        return review_file(path)
+        return review_file(path, lang)
 
     if args.cmd == "import":
-        return import_game(args.file)
+        return import_game(args.file, lang)
 
     if args.cmd == "games":
-        return list_imports()
+        return list_imports(lang)
 
     if args.cmd == "play":
         if not Path(STOCKFISH).exists():
-            print(f"Stockfish nenalezen: {STOCKFISH}\nNastav COACH_STOCKFISH.")
+            print(i18n.t("errors.stockfish_missing", lang, path=STOCKFISH)
+                  + "\n" + i18n.t("errors.env_hint", lang))
             return 2
         color = chess.BLACK if args.color == "black" else chess.WHITE
-        return play(max(4, min(16, args.level)), args.player, color)
+        return play(max(4, min(16, args.level)), args.player, color, lang)
 
     parser.print_help()
     return 1
@@ -353,4 +407,4 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\n  ukončeno")
+        print(i18n.t("cli.stopped"))

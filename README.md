@@ -133,7 +133,8 @@ review (accuracy 87.6 %, average loss 32.0 cp), PGN and resignation.
 
 ## Licence
 
-The repository contains no `LICENSE` file. `python-chess` and Stockfish are
-GPL-3.0-or-later, so a distributed bundle that includes them falls under GPLv3.
-The vendored chess.com artwork and sounds are not licensed for redistribution
-and are included for personal local use only.
+The original code is **GPL-3.0-or-later** (`LICENSE`). `python-chess` and
+Stockfish are also GPL-3.0-or-later, so a distributed bundle falls under GPLv3.
+The vendored chess.com artwork and sounds are **not** licensed for
+redistribution; they are present for personal local use only. See
+`NOTICE-assets.md` — remove `static/vendor/` before redistributing.

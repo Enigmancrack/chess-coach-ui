@@ -14,7 +14,26 @@ from typing import Protocol
 import chess
 import chess.engine
 
-DEFAULT_STOCKFISH = "/home/enigma/projekty/_externi/Stockfish/src/stockfish"
+def _find_stockfish() -> str:
+    """Portable default: PATH first, then the usual package locations, then
+    the author's build (so the repo still works on this machine)."""
+    import shutil
+
+    found = shutil.which("stockfish")
+    if found:
+        return found
+    for candidate in (
+        "/usr/games/stockfish",
+        "/usr/local/bin/stockfish",
+        "/opt/homebrew/bin/stockfish",
+        "/home/enigma/projekty/_externi/Stockfish/src/stockfish",
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return "stockfish"
+
+
+DEFAULT_STOCKFISH = _find_stockfish()
 MATE_CP = 10000
 
 
